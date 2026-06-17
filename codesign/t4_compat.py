@@ -31,6 +31,10 @@ import importlib.machinery
 import torch
 import torch.nn.functional as F
 
+# cross-attn key-offset cache (id(cu_seqlens_k) -> python int offsets); lets the SDPA
+# varlen fallback avoid int(gpu_tensor) syncs during CUDA-graph capture.
+_CU_OFFSET_CACHE = {}
+
 
 # ---------------------------------------------------------------------------
 # SDPA-based replacements for the two flash_attn entry points Infinity uses.
@@ -65,10 +69,21 @@ def _flash_attn_varlen_kvpacked_func(q, kv, cu_seqlens_q, cu_seqlens_k,
     """
     H, c = q.shape[1], q.shape[2]
     B = cu_seqlens_q.shape[0] - 1
+    # CUDA-graph-safe: avoid int(gpu_tensor) (a CPU sync, illegal during capture).
+    # Query offsets are uniform (Lq per sample) -> derive from shapes (pure Python).
+    # Key offsets are constant per prompt -> read via int() ONCE (eager) and cache by
+    # tensor id; in graph mode cu_seqlens_k is the cached (stable-id) tensor, so capture
+    # and replay hit the cache and never sync.
+    Lq = q.shape[0] // B
+    kkey = id(cu_seqlens_k)
+    kofs = _CU_OFFSET_CACHE.get(kkey)
+    if kofs is None:
+        kofs = [int(cu_seqlens_k[i]) for i in range(B + 1)]
+        _CU_OFFSET_CACHE[kkey] = kofs
     outs = []
     for b in range(B):
-        qs, qe = int(cu_seqlens_q[b]), int(cu_seqlens_q[b + 1])
-        ks, ke = int(cu_seqlens_k[b]), int(cu_seqlens_k[b + 1])
+        qs, qe = b * Lq, (b + 1) * Lq
+        ks, ke = kofs[b], kofs[b + 1]
         q_b = q[qs:qe].transpose(0, 1).unsqueeze(0)        # 1 H Lq c
         k_b = kv[ks:ke, 0].transpose(0, 1).unsqueeze(0)    # 1 H Lk c
         v_b = kv[ks:ke, 1].transpose(0, 1).unsqueeze(0)    # 1 H Lk c
