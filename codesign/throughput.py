@@ -72,6 +72,8 @@ def main():
     p.add_argument("--prompt", default="a corgi astronaut, studio lighting")
     p.add_argument("--batches", default="1,2,4,8")
     p.add_argument("--t5_offload", type=int, default=0, choices=[0, 1])
+    p.add_argument("--kv_int8", type=int, default=0, choices=[0, 1],
+                   help="store KV cache in INT8 (halves persistent cache)")
     args = p.parse_args()
     args.cfg = list(map(float, str(args.cfg).split(",")))
     args.cfg = args.cfg[0] if len(args.cfg) == 1 else args.cfg
@@ -81,6 +83,10 @@ def main():
     print(f"[device] {torch.cuda.get_device_name(0)} amp={amp}")
     tt, te = load_tokenizer(t5_path=args.text_encoder_ckpt)
     vae = load_visual_tokenizer(args); model = load_transformer(vae, args)
+    if args.kv_int8:
+        model.use_static_kv = True
+        model.use_kv_int8 = True
+        print("[kv_int8] INT8 KV cache enabled")
     ss = dynamic_resolution_h_w[args.h_div_w_template][args.pn]["scales"]
     ss = [(1, h, w) for (_, h, w) in ss]
 

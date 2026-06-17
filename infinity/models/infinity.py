@@ -571,13 +571,14 @@ class Infinity(nn.Module):
         _static_kv = getattr(self, 'use_static_kv', False) or _use_graph
         _kv_max_len = int(sum(int(np.prod(pn)) for pn in scale_schedule)) if _static_kv else 0
         _kv_preserve = _use_graph and getattr(self, '_gen_idx', 0) >= 1   # keep buffer address stable
+        _kv_int8 = getattr(self, 'use_kv_int8', False)
         if inference_mode:
-            for b in self.unregistered_blocks: (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(True, static=_static_kv, max_len=_kv_max_len, preserve=_kv_preserve)
+            for b in self.unregistered_blocks: (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(True, static=_static_kv, max_len=_kv_max_len, preserve=_kv_preserve, int8=_kv_int8)
         else:
             assert self.num_block_chunks > 1
             for block_chunk_ in self.block_chunks:
                 for module in block_chunk_.module.module:
-                    (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching(True, static=_static_kv, max_len=_kv_max_len, preserve=_kv_preserve)
+                    (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching(True, static=_static_kv, max_len=_kv_max_len, preserve=_kv_preserve, int8=_kv_int8)
         
         abs_cfg_insertion_layers = []
         add_cfg_on_logits, add_cfg_on_probs = False, False

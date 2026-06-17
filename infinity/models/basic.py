@@ -236,6 +236,10 @@ class SelfAttention(nn.Module):
         self.kv_static = False
         self.kv_max_len = 0
         self.kv_len = 0
+        # INT8 KV cache (per-token symmetric quant): halves the persistent cache.
+        self.kv_int8 = False
+        self.cached_ks = None   # K dequant scales (fp), shape (B,H,L,1)
+        self.cached_vs = None   # V dequant scales
 
         self.batch_size = batch_size
         self.use_flex_attn = use_flex_attn
@@ -244,14 +248,17 @@ class SelfAttention(nn.Module):
         self.rope2d_normalized_by_hw = rope2d_normalized_by_hw
 
     
-    def kv_caching(self, enable: bool, static: bool = False, max_len: int = 0, preserve: bool = False): # kv caching: only used during inference
+    def kv_caching(self, enable: bool, static: bool = False, max_len: int = 0, preserve: bool = False, int8: bool = False): # kv caching: only used during inference
         self.caching = enable
         self.kv_static = static and enable
+        self.kv_int8 = int8 and enable
         self.kv_max_len = max_len
         self.kv_len = 0   # reset write offset each generation
         if not preserve:  # preserve keeps the static buffer alive (stable address) for CUDA-graph replay
             self.cached_k = None
             self.cached_v = None
+            self.cached_ks = None
+            self.cached_vs = None
     
     # NOTE: attn_bias_or_two_vector is None during inference
     def forward(self, x, attn_bias_or_two_vector: Union[torch.Tensor, Tuple[torch.IntTensor, torch.IntTensor]], attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0):
@@ -299,8 +306,28 @@ class SelfAttention(nn.Module):
         if rope2d_freqs_grid is not None:
             q, k = apply_rotary_emb(q, k, scale_schedule, rope2d_freqs_grid, self.pad_to_multiplier, self.rope2d_normalized_by_hw, scale_ind) #, freqs_cis=freqs_cis)
         if self.caching:    # kv caching: only used during inference
-            if self.kv_static:
-                # write-at-offset into a static buffer (CUDA-graph friendly). Layout
+            if self.kv_static and self.kv_int8:
+                # INT8 static KV: store int8 + per-token scale (halves persistent cache).
+                # Layout (B, H, L, c). NOTE: attention still dequantizes to fp here, so
+                # this lowers the *persistent* footprint, not the transient attention peak
+                # (that needs a fused dequant-attention kernel).
+                if self.cached_k is None:
+                    self.cached_k = torch.zeros(B, self.num_heads, self.kv_max_len, self.head_dim, dtype=torch.int8, device=k.device)
+                    self.cached_v = torch.zeros(B, self.num_heads, self.kv_max_len, self.head_dim, dtype=torch.int8, device=k.device)
+                    self.cached_ks = k.new_zeros(B, self.num_heads, self.kv_max_len, 1)
+                    self.cached_vs = v.new_zeros(B, self.num_heads, self.kv_max_len, 1)
+                    self.kv_len = 0
+                ks = k.detach().abs().amax(dim=-1, keepdim=True).clamp_min_(1e-6) / 127.0
+                vs = v.detach().abs().amax(dim=-1, keepdim=True).clamp_min_(1e-6) / 127.0
+                self.cached_k[:, :, self.kv_len:self.kv_len + L] = (k / ks).round_().clamp_(-127, 127).to(torch.int8)
+                self.cached_v[:, :, self.kv_len:self.kv_len + L] = (v / vs).round_().clamp_(-127, 127).to(torch.int8)
+                self.cached_ks[:, :, self.kv_len:self.kv_len + L] = ks
+                self.cached_vs[:, :, self.kv_len:self.kv_len + L] = vs
+                self.kv_len += L
+                k = self.cached_k[:, :, :self.kv_len].to(k.dtype) * self.cached_ks[:, :, :self.kv_len]
+                v = self.cached_v[:, :, :self.kv_len].to(v.dtype) * self.cached_vs[:, :, :self.kv_len]
+            elif self.kv_static:
+                # write-at-offset into a static fp buffer (CUDA-graph friendly). Layout
                 # here is (B, H, L, c) -> L_dim == 2 (non-flash SDPA path).
                 if self.cached_k is None:
                     self.cached_k = k.new_zeros(B, self.num_heads, self.kv_max_len, self.head_dim)
