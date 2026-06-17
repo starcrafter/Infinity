@@ -47,10 +47,14 @@ def main():
     res = dynamic_resolution_h_w[tmpl][a.pn]
     tgt_h, tgt_w = res["pixel"]
     ss = [(1, h, w) for (t, h, w) in res["scales"]]
+    # f8 patchify VAE (apply_spatial_patchify=1, patch=8) needs the VAE schedule at 2x
+    # the model schedule -> 4x finer latent grid at the SAME pixel size (better small text).
+    vae_ss = [(1, 2 * h, 2 * w) for (_, h, w) in ss] if a.apply_spatial_patchify else ss
     print(f"[recon] img {W}x{H} (h/w={hw:.3f}) -> template {tmpl}, pn={a.pn}, "
-          f"tgt {tgt_h}x{tgt_w}, {len(ss)} scales")
+          f"tgt {tgt_h}x{tgt_w}, patchify={a.apply_spatial_patchify}, "
+          f"vae final latent grid={vae_ss[-1][1]}x{vae_ss[-1][2]}")
 
-    gt, recon, _ = joint_vi_vae_encode_decode(vae, a.image, ss, dev, tgt_h, tgt_w)
+    gt, recon, _ = joint_vi_vae_encode_decode(vae, a.image, vae_ss, dev, tgt_h, tgt_w)
     os.makedirs(a.out_dir, exist_ok=True)
     cv2.imwrite(os.path.join(a.out_dir, "gt.png"), cv2.cvtColor(gt, cv2.COLOR_RGB2BGR))
     cv2.imwrite(os.path.join(a.out_dir, "recon.png"), cv2.cvtColor(recon, cv2.COLOR_RGB2BGR))
