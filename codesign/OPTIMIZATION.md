@@ -120,7 +120,25 @@ Per-scale capture (gen1) / replay (gen2+) of the 32-block forward, on the static
 1. cross-attn `int(cu_seqlens[b])` → query offsets from shapes, key offsets cached by id (no `.item()`).
 2. `add_lvl_embeding`: `torch.ones(...).to(device)` (host→device copy) → `torch.full(..., device=)` (on-device).
 3. `PYTORCH_ALLOC_CONF=expandable_segments` conflicts with capture → leave it unset for graph runs.
-**T4: OOM** — the 13 per-scale static buffers + graph pool + KV don't fit 16 GB; needs the KV-memory work (§ next) to fit, then graphs would apply there too.
+**T4: OOM** — the 13 per-scale static buffers + graph pool + KV don't fit 16 GB; needs the KV-memory work (below) to fit, then graphs would apply there too.
+
+### Throughput + INT8 KV (A100, bf16, images/sec via static batching)
+| | fp16 KV | **INT8 KV (`--kv_int8`)** |
+|---|---|---|
+| peak @ batch 1 | 16.9 GB | **11.8 GB** |
+| peak @ batch 2 | 25.9 GB | **15.6 GB** |
+| batch 4 | **OOM** | **23.3 GB ✓** |
+| max batch / best img/s | 2 / 0.68 | **4 / 0.71 (+4%)** |
+
+**INT8 KV halves the *persistent* cache** (int8 buffer + per-token scale, dequant on read).
+Earlier worry that the transient fp dequant would dominate the peak was wrong: the
+**32-layer cumulative cache** is what dominates memory, and INT8 halves *that* — so peak
+~halves, batch ceiling 2→4, +4% throughput. Lossy (verify on the 5-prompt eval).
+**Key implication:** batch-1 INT8 peak (11.8 GB) < 14.5 GB → should let the **T4** fit
+T5-resident + CUDA-graphs (which OOM'd in fp16) → a path to port the A100 −67% to the T4.
+
+### 5-prompt eval — CUDA-graph path (A100, per-prompt reset → capture → replay)
+All 5 render correctly (OPEN ✅, FRESH COFFEE ✅, TOKYO mis-spells at this seed — *baseline* model behavior, not the optimization, human/animal clean). Confirms the graph path is correct across diverse prompts.
 
 ### Cross-cutting insights
 1. **The T5 offload is a memory-forced latency tax — the optimal config flips by GPU.** 16 GB T4 *must* offload T5 (OOM otherwise) → pays ~2 s CPU↔GPU transfer/image. 40 GB A100 keeps T5 resident → that vanishes → −49%. Same code, opposite optimum (model × systems × hardware coupling).
