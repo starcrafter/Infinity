@@ -169,6 +169,8 @@ def main():
                    help="lossless: MANUAL per-scale CUDA-graph capture/replay (gen0 warmup, gen1 capture, gen2+ replay)")
     p.add_argument("--vae_channels_last", type=int, default=0, choices=[0, 1],
                    help="lossless: run VAE decode in channels_last (NHWC) — better conv2d throughput on tensor cores")
+    p.add_argument("--compile_vae", type=int, default=0, choices=[0, 1],
+                   help="lossless: torch.compile the VAE decoder (fuses group_norm+silu+conv; fixed shape, no graph breaks)")
     p.add_argument("--int8_gemm", type=int, default=0, choices=[0, 1],
                    help="LOSSY: W8A8 dynamic int8 GEMM on transformer Linear layers (torchao). Gate on the 5-prompt eval.")
     p.add_argument("--fp8_gemm", type=int, default=0, choices=[0, 1],
@@ -215,6 +217,10 @@ def main():
         vae = vae.to(memory_format=torch.channels_last)
         model.vae_channels_last = True
         print("[vae_channels_last] VAE decode in NHWC (channels_last)")
+
+    if getattr(args, "compile_vae", 0):
+        vae.decode = torch.compile(vae.decode)
+        print("[compile_vae] VAE decoder torch.compile'd (first run pays compile cost)")
 
     if getattr(args, "int8_gemm", 0) or getattr(args, "fp8_gemm", 0):
         import torch.nn as _nn
