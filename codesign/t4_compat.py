@@ -27,6 +27,7 @@ implementation — run `python t4_compat.py` to verify before deploying to a T4.
 """
 import sys
 import types
+import importlib.machinery
 import torch
 import torch.nn.functional as F
 
@@ -90,6 +91,14 @@ def install():
         pass
 
     fa = types.ModuleType("flash_attn")
+    # A real __spec__ is REQUIRED: modern transformers probes
+    # importlib.util.find_spec("flash_attn") when importing T5, and a None spec
+    # raises `ValueError: flash_attn.__spec__ is None`. With a valid spec but no
+    # installed distribution, transformers' version check fails gracefully ->
+    # treats FA2 as unavailable (correct on T4), while our `from flash_attn import`
+    # still resolves to the SDPA fallbacks below.
+    fa.__spec__ = importlib.machinery.ModuleSpec("flash_attn", loader=None)
+    fa.__version__ = "0.0.0+sdpa-stub"
     fa.flash_attn_func = _flash_attn_func
     fa.flash_attn_varlen_kvpacked_func = _flash_attn_varlen_kvpacked_func
     sys.modules["flash_attn"] = fa
