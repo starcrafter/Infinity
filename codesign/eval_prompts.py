@@ -48,6 +48,8 @@ def main():
     p.add_argument("--out_dir", default="eval_out")
     p.add_argument("--tag", default="baseline", help="label prefix for output files")
     p.add_argument("--cuda_graph", type=int, default=0, choices=[0,1])
+    p.add_argument("--fp8_gemm", type=int, default=0, choices=[0,1], help="LOSSY (H100): FP8 GEMM — quality check")
+    p.add_argument("--int8_gemm", type=int, default=0, choices=[0,1], help="LOSSY: int8 W8A8 GEMM — quality check")
     args = p.parse_args()
     args.cfg = list(map(float, str(args.cfg).split(",")))
     args.cfg = args.cfg[0] if len(args.cfg) == 1 else args.cfg
@@ -59,6 +61,21 @@ def main():
     text_tokenizer, text_encoder = load_tokenizer(t5_path=args.text_encoder_ckpt)
     vae = load_visual_tokenizer(args)
     model = load_transformer(vae, args)
+
+    if getattr(args, "fp8_gemm", 0) or getattr(args, "int8_gemm", 0):
+        from torchao.quantization import quantize_
+        if args.fp8_gemm:
+            from torchao.quantization import Float8DynamicActivationFloat8WeightConfig as _C
+            try:
+                from torchao.quantization import PerRow
+                quantize_(model, _C(granularity=PerRow()))
+            except Exception:
+                quantize_(model, _C())
+            print("[fp8_gemm] applied (quality eval)")
+        else:
+            from torchao.quantization import Int8DynamicActivationInt8WeightConfig as _C
+            quantize_(model, _C()); print("[int8_gemm] applied (quality eval)")
+
     ss = dynamic_resolution_h_w[args.h_div_w_template][args.pn]["scales"]
     ss = [(1, h, w) for (_, h, w) in ss]
 

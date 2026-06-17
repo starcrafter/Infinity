@@ -32,8 +32,15 @@ import torch
 import torch.nn.functional as F
 try:
     from torch.nn.attention import sdpa_kernel, SDPBackend
-    _SDPA = {"math": SDPBackend.MATH, "mem_efficient": SDPBackend.EFFICIENT_ATTENTION,
-             "flash": SDPBackend.FLASH_ATTENTION}
+    # each backend maps to a PRIORITY LIST (torch 2.9 sdpa_kernel accepts a list and
+    # falls through to the next if a kernel can't run a given shape) so forcing a
+    # backend never hard-errors on the varlen cross-attn fallback shapes.
+    _SDPA = {"math": [SDPBackend.MATH],
+             "mem_efficient": [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH],
+             "flash": [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]}
+    if hasattr(SDPBackend, "CUDNN_ATTENTION"):  # H100/Hopper fused attention (FA3-class)
+        _SDPA["cudnn"] = [SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION,
+                          SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
 except Exception:
     sdpa_kernel, _SDPA = None, {}
 
@@ -104,7 +111,7 @@ def generate(model, vae, text_tokenizer, text_encoder, prompt, scale_schedule,
     # lossless knob: force a specific SDPA backend (Turing has no FA2; default falls
     # back to mem-efficient/math). 'auto' = let torch choose.
     ab = getattr(args, "attn_backend", "auto")
-    sdpa_ctx = sdpa_kernel([_SDPA[ab]]) if (ab in _SDPA and sdpa_kernel) else contextlib.nullcontext()
+    sdpa_ctx = sdpa_kernel(_SDPA[ab]) if (ab in _SDPA and sdpa_kernel) else contextlib.nullcontext()
     # [B] AR transformer + [C] VAE decode happen inside autoregressive_infer_cfg
     with sdpa_ctx, torch.autocast("cuda", dtype=amp_dtype, enabled=True, cache_enabled=True):
         _, _, img_list = model.autoregressive_infer_cfg(
@@ -151,8 +158,8 @@ def main():
     p.add_argument("--profile", type=int, default=0, help="torch.profiler op breakdown")
     p.add_argument("--save_file", type=str, default="./t4_out.jpg")
     p.add_argument("--attn_backend", type=str, default="auto",
-                   choices=["auto", "math", "mem_efficient", "flash"],
-                   help="lossless: force the SDPA backend for self-attention")
+                   choices=["auto", "math", "mem_efficient", "flash", "cudnn"],
+                   help="lossless: force the SDPA backend. 'cudnn' = H100/Hopper fused attention (FA3-class)")
     p.add_argument("--t5_offload", type=int, default=1, choices=[0, 1], help="offload T5 to CPU after encode (saves ~3GB, costs transfer)")
     p.add_argument("--compile", type=int, default=0, choices=[0, 1],
                    help="lossless: torch.compile the transformer blocks (cuts launch overhead)")
@@ -164,6 +171,8 @@ def main():
                    help="lossless: run VAE decode in channels_last (NHWC) — better conv2d throughput on tensor cores")
     p.add_argument("--int8_gemm", type=int, default=0, choices=[0, 1],
                    help="LOSSY: W8A8 dynamic int8 GEMM on transformer Linear layers (torchao). Gate on the 5-prompt eval.")
+    p.add_argument("--fp8_gemm", type=int, default=0, choices=[0, 1],
+                   help="LOSSY (H100+): FP8 (e4m3) dynamic GEMM on transformer Linear layers (torchao). Native Hopper FP8 tensor cores, cheap quant. Gate on the 5-prompt eval.")
     args = p.parse_args()
 
     args.cfg = list(map(float, str(args.cfg).split(",")))
@@ -222,6 +231,25 @@ def main():
             print("[int8_gemm] torchao W8A8 applied to transformer Linear layers")
         except Exception as e:
             print(f"[int8_gemm] FAILED ({type(e).__name__}: {e}); run `pip install torchao`")
+            raise
+
+    if getattr(args, "fp8_gemm", 0):
+        # FP8 (e4m3) dynamic-activation FP8-weight quant — Hopper-native tensor cores.
+        # Unlike A100 int8 (3.5x slower: no native int8 path + heavy quant), H100 has
+        # hardware FP8 GEMM and cheaper quant. Rowwise granularity for quality. Lossy.
+        if cc[0] < 9:
+            print(f"[fp8_gemm] WARNING: sm_{cc[0]}{cc[1]} has no native FP8 tensor cores (need sm_90 H100) — expect a regression")
+        try:
+            from torchao.quantization import quantize_, Float8DynamicActivationFloat8WeightConfig
+            try:
+                from torchao.quantization import PerRow
+                quantize_(model, Float8DynamicActivationFloat8WeightConfig(granularity=PerRow()))
+                print("[fp8_gemm] torchao FP8 e4m3 rowwise applied to transformer Linear layers")
+            except Exception:
+                quantize_(model, Float8DynamicActivationFloat8WeightConfig())
+                print("[fp8_gemm] torchao FP8 e4m3 (per-tensor) applied to transformer Linear layers")
+        except Exception as e:
+            print(f"[fp8_gemm] FAILED ({type(e).__name__}: {e}); needs torchao + H100")
             raise
 
     scale_schedule = dynamic_resolution_h_w[args.h_div_w_template][args.pn]["scales"]
