@@ -511,13 +511,17 @@ class Infinity(nn.Module):
         accu_BChw, cur_L, ret = None, 0, []  # current length, list of reconstructed images
         idx_Bl_list, idx_Bld_list = [], []
 
+        # static KV buffer (write-at-offset) is required for CUDA-graph capture; gated
+        # by self.use_static_kv (default False -> original torch.cat path).
+        _static_kv = getattr(self, 'use_static_kv', False)
+        _kv_max_len = int(sum(int(np.prod(pn)) for pn in scale_schedule)) if _static_kv else 0
         if inference_mode:
-            for b in self.unregistered_blocks: (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(True)
+            for b in self.unregistered_blocks: (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(True, static=_static_kv, max_len=_kv_max_len)
         else:
             assert self.num_block_chunks > 1
             for block_chunk_ in self.block_chunks:
                 for module in block_chunk_.module.module:
-                    (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching(True)
+                    (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching(True, static=_static_kv, max_len=_kv_max_len)
         
         abs_cfg_insertion_layers = []
         add_cfg_on_logits, add_cfg_on_probs = False, False

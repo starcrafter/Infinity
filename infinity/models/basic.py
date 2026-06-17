@@ -231,6 +231,11 @@ class SelfAttention(nn.Module):
         self.caching = False    # kv caching: only used during inference
         self.cached_k = None    # kv caching: only used during inference
         self.cached_v = None    # kv caching: only used during inference
+        # static KV cache (write-at-offset into a pre-allocated buffer) — required
+        # for CUDA-graph capture (the default torch.cat path reallocates each scale).
+        self.kv_static = False
+        self.kv_max_len = 0
+        self.kv_len = 0
 
         self.batch_size = batch_size
         self.use_flex_attn = use_flex_attn
@@ -239,10 +244,13 @@ class SelfAttention(nn.Module):
         self.rope2d_normalized_by_hw = rope2d_normalized_by_hw
 
     
-    def kv_caching(self, enable: bool): # kv caching: only used during inference
+    def kv_caching(self, enable: bool, static: bool = False, max_len: int = 0): # kv caching: only used during inference
         self.caching = enable
         self.cached_k = None
         self.cached_v = None
+        self.kv_static = static and enable
+        self.kv_max_len = max_len
+        self.kv_len = 0
     
     # NOTE: attn_bias_or_two_vector is None during inference
     def forward(self, x, attn_bias_or_two_vector: Union[torch.Tensor, Tuple[torch.IntTensor, torch.IntTensor]], attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0):
@@ -290,7 +298,19 @@ class SelfAttention(nn.Module):
         if rope2d_freqs_grid is not None:
             q, k = apply_rotary_emb(q, k, scale_schedule, rope2d_freqs_grid, self.pad_to_multiplier, self.rope2d_normalized_by_hw, scale_ind) #, freqs_cis=freqs_cis)
         if self.caching:    # kv caching: only used during inference
-            if self.cached_k is None: self.cached_k = k; self.cached_v = v
+            if self.kv_static:
+                # write-at-offset into a static buffer (CUDA-graph friendly). Layout
+                # here is (B, H, L, c) -> L_dim == 2 (non-flash SDPA path).
+                if self.cached_k is None:
+                    self.cached_k = k.new_zeros(B, self.num_heads, self.kv_max_len, self.head_dim)
+                    self.cached_v = v.new_zeros(B, self.num_heads, self.kv_max_len, self.head_dim)
+                    self.kv_len = 0
+                self.cached_k[:, :, self.kv_len:self.kv_len + L] = k
+                self.cached_v[:, :, self.kv_len:self.kv_len + L] = v
+                self.kv_len += L
+                k = self.cached_k[:, :, :self.kv_len]
+                v = self.cached_v[:, :, :self.kv_len]
+            elif self.cached_k is None: self.cached_k = k; self.cached_v = v
             else: k = self.cached_k = torch.cat((self.cached_k, k), dim=L_dim); v = self.cached_v = torch.cat((self.cached_v, v), dim=L_dim)
         
         if self.using_flash:

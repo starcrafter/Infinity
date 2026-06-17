@@ -156,6 +156,8 @@ def main():
     p.add_argument("--t5_offload", type=int, default=1, choices=[0, 1], help="offload T5 to CPU after encode (saves ~3GB, costs transfer)")
     p.add_argument("--compile", type=int, default=0, choices=[0, 1],
                    help="lossless: torch.compile the transformer blocks (cuts launch overhead)")
+    p.add_argument("--static_kv", type=int, default=0, choices=[0, 1],
+                   help="lossless: static write-at-offset KV buffer (CUDA-graph prerequisite)")
     args = p.parse_args()
 
     args.cfg = list(map(float, str(args.cfg).split(",")))
@@ -180,6 +182,10 @@ def main():
         for b in model.unregistered_blocks:
             b.forward = torch.compile(b.forward, mode="reduce-overhead")
         print("[compile] block.forward torch.compile(mode=reduce-overhead, cudagraphs) — first run pays compile cost")
+
+    if getattr(args, "static_kv", 0):
+        model.use_static_kv = True
+        print("[static_kv] enabled — write-at-offset KV buffer (CUDA-graph prerequisite)")
 
     scale_schedule = dynamic_resolution_h_w[args.h_div_w_template][args.pn]["scales"]
     scale_schedule = [(1, h, w) for (_, h, w) in scale_schedule]
