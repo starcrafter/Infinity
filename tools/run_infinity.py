@@ -194,26 +194,38 @@ def load_infinity(
             inference_mode=True,
             train_h_div_w_list=[1.0],
             **model_kwargs,
-        ).to(device=device)
+        )  # NOTE: built on CPU (no .to(device) here) — avoids fp32-on-GPU plus the
+           # transient 2x copy during torch.load that OOMs a 16GB T4.
         print(f'[you selected Infinity with {model_kwargs=}] model size: {sum(p.numel() for p in infinity_test.parameters())/1e9:.2f}B, bf16={bf16}')
 
+        # Storage dtype for the (dominant) transformer blocks:
+        #   bf16 on Ampere+ (A100); fp16 on Turing (T4, no bf16) to fit 16GB; else fp32.
+        dev_str = str(device)
+        cc = torch.cuda.get_device_capability(0) if ('cuda' in dev_str and torch.cuda.is_available()) else (0, 0)
         if bf16:
+            block_dtype = torch.bfloat16
+        elif 'cuda' in dev_str and cc[0] < 8:
+            block_dtype = torch.float16
+        else:
+            block_dtype = torch.float32
+        if block_dtype != torch.float32:
             for block in infinity_test.unregistered_blocks:
-                block.bfloat16()
+                block.to(block_dtype)
 
         infinity_test.eval()
         infinity_test.requires_grad_(False)
 
-        infinity_test.cuda()
-        torch.cuda.empty_cache()
-
-        print(f'[Load Infinity weights]')
+        print(f'[Load Infinity weights] block_dtype={block_dtype}')
         if checkpoint_type == 'torch':
-            state_dict = torch.load(model_path, map_location=device)
+            state_dict = torch.load(model_path, map_location='cpu')  # load on CPU; cast happens on copy_
             print(infinity_test.load_state_dict(state_dict))
+            del state_dict
         elif checkpoint_type == 'torch_shard':
             from transformers.modeling_utils import load_sharded_checkpoint
             load_sharded_checkpoint(infinity_test, model_path, strict=False)
+        infinity_test = infinity_test.to(device=device)  # move once, in target dtype
+        if 'cuda' in dev_str:
+            torch.cuda.empty_cache()
         infinity_test.rng = torch.Generator(device=device)
         return infinity_test
 
