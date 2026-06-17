@@ -212,8 +212,13 @@ def main():
         # Lossy -> validate on the 5-prompt eval before trusting. Incompatible with
         # CUDA graphs (subclass tensors + dynamic quant), so run it standalone.
         try:
-            from torchao.quantization import quantize_, int8_dynamic_activation_int8_weight
-            quantize_(model, int8_dynamic_activation_int8_weight())
+            from torchao.quantization import quantize_
+            try:  # torchao >=0.10 config API
+                from torchao.quantization import Int8DynamicActivationInt8WeightConfig as _W8A8
+                quantize_(model, _W8A8())
+            except ImportError:  # older function API
+                from torchao.quantization import int8_dynamic_activation_int8_weight as _W8A8
+                quantize_(model, _W8A8())
             print("[int8_gemm] torchao W8A8 applied to transformer Linear layers")
         except Exception as e:
             print(f"[int8_gemm] FAILED ({type(e).__name__}: {e}); run `pip install torchao`")
