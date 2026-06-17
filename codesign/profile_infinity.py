@@ -160,6 +160,10 @@ def main():
                    help="lossless: static write-at-offset KV buffer (CUDA-graph prerequisite)")
     p.add_argument("--cuda_graph", type=int, default=0, choices=[0, 1],
                    help="lossless: MANUAL per-scale CUDA-graph capture/replay (gen0 warmup, gen1 capture, gen2+ replay)")
+    p.add_argument("--vae_channels_last", type=int, default=0, choices=[0, 1],
+                   help="lossless: run VAE decode in channels_last (NHWC) — better conv2d throughput on tensor cores")
+    p.add_argument("--int8_gemm", type=int, default=0, choices=[0, 1],
+                   help="LOSSY: W8A8 dynamic int8 GEMM on transformer Linear layers (torchao). Gate on the 5-prompt eval.")
     args = p.parse_args()
 
     args.cfg = list(map(float, str(args.cfg).split(",")))
@@ -197,6 +201,23 @@ def main():
         model._gen_idx = 0
         print("[cuda_graph] MANUAL per-scale capture/replay enabled "
               "(needs >=3 runs: warmup=alloc, run0=capture, run1+=replay)")
+
+    if getattr(args, "vae_channels_last", 0):
+        vae = vae.to(memory_format=torch.channels_last)
+        model.vae_channels_last = True
+        print("[vae_channels_last] VAE decode in NHWC (channels_last)")
+
+    if getattr(args, "int8_gemm", 0):
+        # W8A8 dynamic-activation int8 weight quant on the transformer's Linear layers.
+        # Lossy -> validate on the 5-prompt eval before trusting. Incompatible with
+        # CUDA graphs (subclass tensors + dynamic quant), so run it standalone.
+        try:
+            from torchao.quantization import quantize_, int8_dynamic_activation_int8_weight
+            quantize_(model, int8_dynamic_activation_int8_weight())
+            print("[int8_gemm] torchao W8A8 applied to transformer Linear layers")
+        except Exception as e:
+            print(f"[int8_gemm] FAILED ({type(e).__name__}: {e}); run `pip install torchao`")
+            raise
 
     scale_schedule = dynamic_resolution_h_w[args.h_div_w_template][args.pn]["scales"]
     scale_schedule = [(1, h, w) for (_, h, w) in scale_schedule]

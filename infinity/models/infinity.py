@@ -709,7 +709,10 @@ class Infinity(nn.Module):
             return ret, idx_Bl_list, []
         
         if vae_type != 0:
-            img = vae.decode(summed_codes.squeeze(-3))
+            _sc = summed_codes.squeeze(-3)
+            if getattr(self, 'vae_channels_last', False):
+                _sc = _sc.contiguous(memory_format=torch.channels_last)
+            img = vae.decode(_sc)
         else:
             img = vae.viz_from_ms_h_BChw(ret, scale_schedule=scale_schedule, same_shape=True, last_one=True)
 
