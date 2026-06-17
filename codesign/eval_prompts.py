@@ -71,6 +71,8 @@ def main():
         if args.fp8_gemm:
             from torchao.quantization import Float8DynamicActivationFloat8WeightConfig as _C
             from torchao.quantization.granularity import PerRow
+            for _m in model.modules():
+                if isinstance(_m, _nn.Linear): _m.to(torch.bfloat16)  # PerRow needs bf16
             quantize_(model, _C(granularity=PerRow()), filter_fn=_qfilter)
             print("[fp8_gemm] applied (quality eval)")
         else:

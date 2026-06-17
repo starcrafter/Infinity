@@ -239,6 +239,11 @@ def main():
             print(f"[fp8_gemm] WARNING: sm_{cc[0]}{cc[1]} has no native FP8 (need sm_90) — expect a regression")
         from torchao.quantization import Float8DynamicActivationFloat8WeightConfig as _FP8
         from torchao.quantization.granularity import PerRow
+        # PerRow FP8 requires bf16 weights; the block weights are loaded fp16 (T4 fix).
+        # bf16 is native on H100 and matches the autocast dtype, so cast Linear weights.
+        for _m in model.modules():
+            if isinstance(_m, _nn.Linear):
+                _m.to(torch.bfloat16)
         quantize_(model, _FP8(granularity=PerRow()), filter_fn=_qfilter)
         print("[fp8_gemm] torchao FP8 e4m3 rowwise applied (MLP/proj/mat_q; mat_qkv/mat_kv skipped)")
 
