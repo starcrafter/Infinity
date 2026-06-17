@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+t4_trace.json
+*.jpg
