@@ -30,6 +30,12 @@ t4_compat.install()
 import numpy as np
 import torch
 import torch.nn.functional as F
+try:
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+    _SDPA = {"math": SDPBackend.MATH, "mem_efficient": SDPBackend.EFFICIENT_ATTENTION,
+             "flash": SDPBackend.FLASH_ATTENTION}
+except Exception:
+    sdpa_kernel, _SDPA = None, {}
 
 # repo root on path
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -92,8 +98,12 @@ def generate(model, vae, text_tokenizer, text_encoder, prompt, scale_schedule,
     tau = [args.tau] * len(scale_schedule)
 
     scale_events, restore = make_per_scale_hook(model)
+    # lossless knob: force a specific SDPA backend (Turing has no FA2; default falls
+    # back to mem-efficient/math). 'auto' = let torch choose.
+    ab = getattr(args, "attn_backend", "auto")
+    sdpa_ctx = sdpa_kernel([_SDPA[ab]]) if (ab in _SDPA and sdpa_kernel) else contextlib.nullcontext()
     # [B] AR transformer + [C] VAE decode happen inside autoregressive_infer_cfg
-    with torch.autocast("cuda", dtype=amp_dtype, enabled=True, cache_enabled=True):
+    with sdpa_ctx, torch.autocast("cuda", dtype=amp_dtype, enabled=True, cache_enabled=True):
         _, _, img_list = model.autoregressive_infer_cfg(
             vae=vae, scale_schedule=scale_schedule, label_B_or_BLT=text_cond,
             B=1, negative_label_B_or_BLT=None, force_gt_Bhw=None, g_seed=args.seed,
@@ -137,6 +147,11 @@ def main():
     p.add_argument("--runs", type=int, default=3, help="timed runs after 1 warmup")
     p.add_argument("--profile", type=int, default=0, help="torch.profiler op breakdown")
     p.add_argument("--save_file", type=str, default="./t4_out.jpg")
+    p.add_argument("--attn_backend", type=str, default="auto",
+                   choices=["auto", "math", "mem_efficient", "flash"],
+                   help="lossless: force the SDPA backend for self-attention")
+    p.add_argument("--compile", type=int, default=0, choices=[0, 1],
+                   help="lossless: torch.compile the transformer blocks (cuts launch overhead)")
     args = p.parse_args()
 
     args.cfg = list(map(float, str(args.cfg).split(",")))
@@ -153,6 +168,11 @@ def main():
     text_tokenizer, text_encoder = load_tokenizer(t5_path=args.text_encoder_ckpt)
     vae = load_visual_tokenizer(args)
     model = load_transformer(vae, args)
+
+    if args.compile:
+        for b in model.unregistered_blocks:
+            b.forward = torch.compile(b.forward, dynamic=True)
+        print("[compile] block.forward torch.compile(dynamic=True) — first run pays compile cost")
 
     scale_schedule = dynamic_resolution_h_w[args.h_div_w_template][args.pn]["scales"]
     scale_schedule = [(1, h, w) for (_, h, w) in scale_schedule]

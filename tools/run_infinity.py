@@ -42,7 +42,10 @@ def encode_prompt(text_tokenizer, text_encoder, prompt, enable_positive_prompt=F
         print(f'after positive_prompt aug: {prompt}')
     print(f'prompt={prompt}')
     captions = [prompt]
-    tokens = text_tokenizer(text=captions, max_length=512, padding='max_length', truncation=True, return_tensors='pt')  # todo: put this into dataset
+    # LOSSLESS: pad to the longest real sequence, NOT a fixed 512. The encoder output
+    # for real tokens is identical under the attention mask, and only feat_i[:len_i] is
+    # kept below — so padding to 512 just wastes ~15-25x T5 compute on short prompts.
+    tokens = text_tokenizer(text=captions, max_length=512, padding='longest', truncation=True, return_tensors='pt')
     input_ids = tokens.input_ids.cuda(non_blocking=True)
     mask = tokens.attention_mask.cuda(non_blocking=True)
     text_features = text_encoder(input_ids=input_ids, attention_mask=mask)['last_hidden_state'].float()
