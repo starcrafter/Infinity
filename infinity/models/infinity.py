@@ -346,7 +346,9 @@ class Infinity(nn.Module):
         patch_t, patch_h, patch_w = scale_schedule[scale_ind]
         t_mul_h_mul_w = patch_t * patch_h * patch_w
         assert t_mul_h_mul_w + need_to_pad == seq_len
-        feature[:, :t_mul_h_mul_w] += self.lvl_embed(scale_ind*torch.ones((bs, t_mul_h_mul_w),dtype=torch.int).to(feature.device))
+        # create the index tensor directly on-device — a CPU tensor + .to(device) is a
+        # host->device copy that's illegal during CUDA-graph capture.
+        feature[:, :t_mul_h_mul_w] += self.lvl_embed(torch.full((bs, t_mul_h_mul_w), scale_ind, dtype=torch.int, device=feature.device))
         return feature
     
     def add_lvl_embeding_for_x_BLC(self, x_BLC, scale_schedule, need_to_pad=0):
