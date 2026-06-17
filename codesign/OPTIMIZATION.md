@@ -112,7 +112,15 @@ The runner auto-selects bf16 (A100) / fp16 (T4). Outputs: macro stage breakdown 
 |---|---|---|
 | **T5 resident** (`--t5_offload 0`) | **2.01 s (−49%)** | ✅✅ biggest win, **fully lossless**; T5 encode 1898 → **32 ms**; fits 40 GB |
 | no-CFG (`--cfg 1`) | 3.40 s (−13%) | ⚠️ lossy; smaller win (AR already small on A100) |
-| CUDA-graph compile (`--compile`, reduce-overhead) | **RuntimeError** | ❌ torch.compile auto-cudagraphs overwrite the FFN-residual/KV buffers |
+| torch.compile auto-cudagraphs (`--compile`) | **RuntimeError** | ❌ residual/KV buffer aliasing + cross-attn graph breaks |
+| **MANUAL CUDA graphs** (`--cuda_graph`, on static-KV) | **1.28 s (−32% vs T5-resident; −67% vs orig)** | ✅✅ **lossless** (replay byte-identical), per-scale capture/replay |
+
+### Manual CUDA-graph capture (the (a) deliverable) — works on A100
+Per-scale capture (gen1) / replay (gen2+) of the 32-block forward, on the static-KV buffer, with cached stable cond/ca_kv. **1887 ms → 1284 ms (−32%)**, output bit-identical to eager. Three capture-unsafe ops had to be fixed (all CPU↔GPU syncs illegal during capture):
+1. cross-attn `int(cu_seqlens[b])` → query offsets from shapes, key offsets cached by id (no `.item()`).
+2. `add_lvl_embeding`: `torch.ones(...).to(device)` (host→device copy) → `torch.full(..., device=)` (on-device).
+3. `PYTORCH_ALLOC_CONF=expandable_segments` conflicts with capture → leave it unset for graph runs.
+**T4: OOM** — the 13 per-scale static buffers + graph pool + KV don't fit 16 GB; needs the KV-memory work (§ next) to fit, then graphs would apply there too.
 
 ### Cross-cutting insights
 1. **The T5 offload is a memory-forced latency tax — the optimal config flips by GPU.** 16 GB T4 *must* offload T5 (OOM otherwise) → pays ~2 s CPU↔GPU transfer/image. 40 GB A100 keeps T5 resident → that vanishes → −49%. Same code, opposite optimum (model × systems × hardware coupling).
