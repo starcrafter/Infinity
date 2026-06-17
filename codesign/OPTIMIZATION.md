@@ -96,8 +96,34 @@ python codesign/profile_infinity.py \
 ```
 The runner auto-selects bf16 (A100) / fp16 (T4). Outputs: macro stage breakdown (T5 / AR / decode), **per-scale transformer ms**, a torch.profiler op table + `t4_trace.json`. **Benchmark on A100 first** to get the profile shape, then re-run on a T4 to see how the gap (no FA2, fp16, smaller HBM) shifts the bottleneck.
 
-## 7. Status
-- [x] Repo cloned, inference path mapped (this doc).
-- [x] T4 compat shim written + **cross-attn fallback unit-tested on CPU** (`t4_compat.py`).
-- [x] fp16 instrumented profiler written (`profile_infinity_t4.py`), syntax-checked.
-- [ ] **Run on T4** → confirm the profile shape, then implement the top-3 levers in priority order.
+## 7. MEASURED RESULTS — Infinity-2B, 1024px (pn=1M), cfg=4 unless noted
+
+### T4 (Tesla T4, fp16, 16 GB) — baseline **13.6 s** (T5 2.3 s / AR+decode 11.3 s)
+| Lever | Result | Verdict |
+|---|---|---|
+| mem-efficient attention (`--attn_backend mem_efficient`) | ≈ baseline | ❌ no win — SDPA already defaults to it (no FA2 on sm_75) |
+| `torch.compile(dynamic=True)` | ≈ baseline | ❌ no win — graph breaks (varlen cross-attn) + per-scale shapes |
+| **T5 resident** (`--t5_offload 0`) | **OOM** | ❌ doesn't fit 16 GB (fp16 model 4.4 + T5 3 + KV 5.5 + act > 14.5) |
+| T5 dynamic padding (`padding='longest'`) | bit-identical | ✅ free, but masked by the *forced* offload transfer |
+| **no-CFG** (`--cfg 1`, bs 2→1) | **9.3 s (−31%)** | ⚠️ lossy; text held on easy prompts, risky in general |
+
+### A100 (A100-SXM4-40 GB, bf16) — baseline **3.92 s** (T5 1.90 s / AR+decode 2.02 s)
+| Lever | Result | Verdict |
+|---|---|---|
+| **T5 resident** (`--t5_offload 0`) | **2.01 s (−49%)** | ✅✅ biggest win, **fully lossless**; T5 encode 1898 → **32 ms**; fits 40 GB |
+| no-CFG (`--cfg 1`) | 3.40 s (−13%) | ⚠️ lossy; smaller win (AR already small on A100) |
+| CUDA-graph compile (`--compile`, reduce-overhead) | **RuntimeError** | ❌ torch.compile auto-cudagraphs overwrite the FFN-residual/KV buffers |
+
+### Cross-cutting insights
+1. **The T5 offload is a memory-forced latency tax — the optimal config flips by GPU.** 16 GB T4 *must* offload T5 (OOM otherwise) → pays ~2 s CPU↔GPU transfer/image. 40 GB A100 keeps T5 resident → that vanishes → −49%. Same code, opposite optimum (model × systems × hardware coupling).
+2. **Once AR is fast (A100), T5 dominates** (48% of baseline) — so the lossless T5 fixes are the top A100 lever. Dynamic padding makes the resident encode 32 ms.
+3. **CFG matters less on A100** (−13%) than T4 (−31%) — AR is a smaller fraction.
+4. **Launch overhead is real but needs MANUAL CUDA graphs.** The small scales 0–4 are flat ~95 ms (T4) = host dispatch + ~450 launches/scale. torch.compile's *automatic* cudagraphs error on this model's residual+growing-KV loop → manual capture with static KV buffers required (see §8).
+
+## 8. NEXT: manual CUDA-graph capture (the real launch-overhead fix)
+Plan: pre-allocate the self-attn KV cache as **static max-length buffers** (write-at-offset instead of `torch.cat`), fix shapes per scale, and capture **one `torch.cuda.CUDAGraph` per scale** over the 32-block stack → replay (≈450 launches/scale → 1). Sampling + VAE-quant stay in eager between scales. Biggest on the launch-bound small scales; helps proportionally more on A100 (faster kernels). C++/LibTorch is a later option (removes Python dispatch but still needs the graph management).
+
+## 9. Recommendations
+- **A100 deploy:** `--t5_offload 0` (resident T5) + dynamic padding → **2.0 s, lossless.** Ship.
+- **T4 deploy:** memory blocks T5-resident; levers are CFG-interval (lossy) + manual CUDA graphs.
+- **Next eng:** (1) manual CUDA-graph capture (§8); (2) proper CFG-interval (partial guidance, not all-or-nothing).
