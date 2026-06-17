@@ -79,8 +79,13 @@ def make_per_scale_hook(model):
 def generate(model, vae, text_tokenizer, text_encoder, prompt, scale_schedule,
              args, timer: CudaTimer, amp_dtype):
     timer.mark("start")
-    # [A] text encode
+    # [A] text encode — keep T5 on GPU only for the encode, then OFFLOAD to CPU.
+    # T5 (~3GB fp16) is only needed for the prompt; freeing it gives the AR loop's
+    # KV cache (~5.5GB at bs=2 for CFG, 10.5k cumulative tokens) room on a 16GB T4.
+    text_encoder.cuda()
     text_cond = encode_prompt(text_tokenizer, text_encoder, prompt)
+    text_encoder.to("cpu")
+    torch.cuda.empty_cache()
     timer.mark("t5_encode")
 
     cfg = args.cfg if isinstance(args.cfg, list) else [args.cfg] * len(scale_schedule)
