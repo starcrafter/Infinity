@@ -540,6 +540,11 @@ class Infinity(nn.Module):
         num_stages_minus_1 = len(scale_schedule)-1
         summed_codes = 0
         for si, pn in enumerate(scale_schedule):   # si: i-th segment
+            # CUDA-graph (reduce-overhead) reuses static output buffers across the
+            # scale loop; tell the cudagraph tree a new step begins so it doesn't
+            # error "output overwritten by a subsequent run".
+            if getattr(self, '_mark_cudagraph_step', False):
+                torch.compiler.cudagraph_mark_step_begin()
             cfg = cfg_list[si]
             if si >= trunk_scale:
                 break

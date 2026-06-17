@@ -181,7 +181,10 @@ def main():
         # (dynamic=True would DISABLE cudagraphs, which is why the earlier attempt was a no-op.)
         for b in model.unregistered_blocks:
             b.forward = torch.compile(b.forward, mode="reduce-overhead")
+        model._mark_cudagraph_step = True   # mark a new cudagraph step each scale
         print("[compile] block.forward torch.compile(mode=reduce-overhead, cudagraphs) — first run pays compile cost")
+        if not getattr(args, "static_kv", 0):
+            print("[compile] NOTE: pair with --static_kv 1 — CUDA graphs need the static KV buffer (fixed addresses)")
 
     if getattr(args, "static_kv", 0):
         model.use_static_kv = True
