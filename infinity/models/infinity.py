@@ -452,6 +452,35 @@ class Infinity(nn.Module):
         # [3. unpad the seqlen dim, and then get logits]
         return self.get_logits(x_BLC[:, :l_end], cond_BD)    # return logits BLV, V is vocab_size
 
+    def _scale_blocks(self, last_stage, si, cond_BD_or_gss, ca_kv, scale_schedule, need_to_pad=0, attn_fn=None):
+        """Per-scale 32-block forward — the unit captured as a CUDA graph. No in-loop
+        CFG mixing (valid when CFG is applied on logits, i.e. cfg_insertion_layer=0)."""
+        for block_idx, b in enumerate(self.block_chunks):
+            if (not self.add_lvl_embeding_only_first_block) or (block_idx == 0):
+                last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
+            for m in b.module:
+                last_stage = m(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=None, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si)
+        return last_stage
+
+    def _scale_blocks_graphed(self, si, last_stage, cond_BD_or_gss, ca_kv, scale_schedule, need_to_pad=0, attn_fn=None):
+        """Capture (first time a scale is seen) / replay a CUDA graph of _scale_blocks.
+        Prereqs: static KV buffer (allocated on gen 0, preserved after) and stable
+        cond/ca_kv (cached on gen 0). The per-scale KV write offset is baked into each
+        scale's graph. Sampling + VAE-quant stay eager between replays."""
+        if not hasattr(self, '_cg'):
+            self._cg = {}
+        if si not in self._cg:
+            static_in = last_stage.clone()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                static_out = self._scale_blocks(static_in, si, cond_BD_or_gss, ca_kv, scale_schedule, need_to_pad, attn_fn)
+            self._cg[si] = (g, static_in, static_out)
+            return static_out
+        g, static_in, static_out = self._cg[si]
+        static_in.copy_(last_stage)
+        g.replay()
+        return static_out
+
     @torch.no_grad()
     def autoregressive_infer_cfg(
         self,
@@ -508,20 +537,33 @@ class Infinity(nn.Module):
 
         with torch.amp.autocast('cuda', enabled=False):
             cond_BD_or_gss = self.shared_ada_lin(cond_BD.float()).float().contiguous()
+
+        # CUDA-graph mode: a captured graph references fixed tensor addresses, so the
+        # prompt-conditioned tensors (cond, cross-attn KV) must be STABLE across images.
+        # Cache them on gen 0 and reuse (assumes fixed prompt across captured/replayed
+        # images — the benchmark case).
+        _use_graph = getattr(self, 'use_cuda_graph', False)
+        if _use_graph:
+            if getattr(self, '_gen_idx', 0) == 0:
+                self._cg_cond_BD, self._cg_cond_gss, self._cg_cakv = cond_BD, cond_BD_or_gss, ca_kv
+            else:
+                cond_BD, cond_BD_or_gss, ca_kv = self._cg_cond_BD, self._cg_cond_gss, self._cg_cakv
+
         accu_BChw, cur_L, ret = None, 0, []  # current length, list of reconstructed images
         idx_Bl_list, idx_Bld_list = [], []
 
         # static KV buffer (write-at-offset) is required for CUDA-graph capture; gated
-        # by self.use_static_kv (default False -> original torch.cat path).
-        _static_kv = getattr(self, 'use_static_kv', False)
+        # by self.use_static_kv (graph mode forces it on).
+        _static_kv = getattr(self, 'use_static_kv', False) or _use_graph
         _kv_max_len = int(sum(int(np.prod(pn)) for pn in scale_schedule)) if _static_kv else 0
+        _kv_preserve = _use_graph and getattr(self, '_gen_idx', 0) >= 1   # keep buffer address stable
         if inference_mode:
-            for b in self.unregistered_blocks: (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(True, static=_static_kv, max_len=_kv_max_len)
+            for b in self.unregistered_blocks: (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(True, static=_static_kv, max_len=_kv_max_len, preserve=_kv_preserve)
         else:
             assert self.num_block_chunks > 1
             for block_chunk_ in self.block_chunks:
                 for module in block_chunk_.module.module:
-                    (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching(True, static=_static_kv, max_len=_kv_max_len)
+                    (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching(True, static=_static_kv, max_len=_kv_max_len, preserve=_kv_preserve)
         
         abs_cfg_insertion_layers = []
         add_cfg_on_logits, add_cfg_on_probs = False, False
@@ -559,21 +601,26 @@ class Infinity(nn.Module):
                 attn_fn = self.attn_fn_compile_dict.get(tuple(scale_schedule[:(si+1)]), None)
 
             # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
-            layer_idx = 0
-            for block_idx, b in enumerate(self.block_chunks):
-                # last_stage shape: [4, 1, 2048], cond_BD_or_gss.shape: [4, 1, 6, 2048], ca_kv[0].shape: [64, 2048], ca_kv[1].shape [5], ca_kv[2]: int
-                if self.add_lvl_embeding_only_first_block and block_idx == 0:
-                    last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
-                if not self.add_lvl_embeding_only_first_block: 
-                    last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
-                
-                for m in b.module:
-                    last_stage = m(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=None, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si)
-                    if (cfg != 1) and (layer_idx in abs_cfg_insertion_layers):
-                        # print(f'add cfg={cfg} on {layer_idx}-th layer output')
-                        last_stage = cfg * last_stage[:B] + (1-cfg) * last_stage[B:]
-                        last_stage = torch.cat((last_stage, last_stage), 0)
-                    layer_idx += 1
+            # MANUAL CUDA-GRAPH path: capture (gen 1) / replay (gen 2+) the per-scale
+            # 32-block forward. Only when CFG is applied on logits (no in-loop mixing).
+            if getattr(self, 'use_cuda_graph', False) and getattr(self, '_gen_idx', 0) >= 1 and not abs_cfg_insertion_layers:
+                last_stage = self._scale_blocks_graphed(si, last_stage, cond_BD_or_gss, ca_kv, scale_schedule, need_to_pad, attn_fn)
+            else:
+                layer_idx = 0
+                for block_idx, b in enumerate(self.block_chunks):
+                    # last_stage shape: [4, 1, 2048], cond_BD_or_gss.shape: [4, 1, 6, 2048], ca_kv[0].shape: [64, 2048], ca_kv[1].shape [5], ca_kv[2]: int
+                    if self.add_lvl_embeding_only_first_block and block_idx == 0:
+                        last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
+                    if not self.add_lvl_embeding_only_first_block:
+                        last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
+
+                    for m in b.module:
+                        last_stage = m(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=None, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si)
+                        if (cfg != 1) and (layer_idx in abs_cfg_insertion_layers):
+                            # print(f'add cfg={cfg} on {layer_idx}-th layer output')
+                            last_stage = cfg * last_stage[:B] + (1-cfg) * last_stage[B:]
+                            last_stage = torch.cat((last_stage, last_stage), 0)
+                        layer_idx += 1
             
             if (cfg != 1) and add_cfg_on_logits:
                 # print(f'add cfg on add_cfg_on_logits')
@@ -630,13 +677,18 @@ class Infinity(nn.Module):
                 last_stage = self.word_embed(self.norm0_ve(last_stage))
                 last_stage = last_stage.repeat(bs//B, 1, 1)
 
+        # graph mode: keep the static KV buffers alive across images (preserve=True),
+        # else the captured graphs' baked addresses go stale.
         if inference_mode:
-            for b in self.unregistered_blocks: (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(False)
+            for b in self.unregistered_blocks: (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(False, preserve=_use_graph)
         else:
             assert self.num_block_chunks > 1
             for block_chunk_ in self.block_chunks:
                 for module in block_chunk_.module.module:
-                    (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching(False)
+                    (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching(False, preserve=_use_graph)
+
+        if _use_graph:
+            self._gen_idx = getattr(self, '_gen_idx', 0) + 1
 
         if not ret_img:
             return ret, idx_Bl_list, []

@@ -244,13 +244,14 @@ class SelfAttention(nn.Module):
         self.rope2d_normalized_by_hw = rope2d_normalized_by_hw
 
     
-    def kv_caching(self, enable: bool, static: bool = False, max_len: int = 0): # kv caching: only used during inference
+    def kv_caching(self, enable: bool, static: bool = False, max_len: int = 0, preserve: bool = False): # kv caching: only used during inference
         self.caching = enable
-        self.cached_k = None
-        self.cached_v = None
         self.kv_static = static and enable
         self.kv_max_len = max_len
-        self.kv_len = 0
+        self.kv_len = 0   # reset write offset each generation
+        if not preserve:  # preserve keeps the static buffer alive (stable address) for CUDA-graph replay
+            self.cached_k = None
+            self.cached_v = None
     
     # NOTE: attn_bias_or_two_vector is None during inference
     def forward(self, x, attn_bias_or_two_vector: Union[torch.Tensor, Tuple[torch.IntTensor, torch.IntTensor]], attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0):

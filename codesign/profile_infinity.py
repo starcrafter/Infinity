@@ -158,6 +158,8 @@ def main():
                    help="lossless: torch.compile the transformer blocks (cuts launch overhead)")
     p.add_argument("--static_kv", type=int, default=0, choices=[0, 1],
                    help="lossless: static write-at-offset KV buffer (CUDA-graph prerequisite)")
+    p.add_argument("--cuda_graph", type=int, default=0, choices=[0, 1],
+                   help="lossless: MANUAL per-scale CUDA-graph capture/replay (gen0 warmup, gen1 capture, gen2+ replay)")
     args = p.parse_args()
 
     args.cfg = list(map(float, str(args.cfg).split(",")))
@@ -189,6 +191,12 @@ def main():
     if getattr(args, "static_kv", 0):
         model.use_static_kv = True
         print("[static_kv] enabled — write-at-offset KV buffer (CUDA-graph prerequisite)")
+
+    if getattr(args, "cuda_graph", 0):
+        model.use_cuda_graph = True   # forces static KV; gen0 warmup, gen1 capture, gen2+ replay
+        model._gen_idx = 0
+        print("[cuda_graph] MANUAL per-scale capture/replay enabled "
+              "(needs >=3 runs: warmup=alloc, run0=capture, run1+=replay)")
 
     scale_schedule = dynamic_resolution_h_w[args.h_div_w_template][args.pn]["scales"]
     scale_schedule = [(1, h, w) for (_, h, w) in scale_schedule]
