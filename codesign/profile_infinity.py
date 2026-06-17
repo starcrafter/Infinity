@@ -174,9 +174,12 @@ def main():
     model = load_transformer(vae, args)
 
     if args.compile:
+        # reduce-overhead = CUDA graphs (static per-scale shapes) -> collapses the
+        # ~450 kernel launches/scale that make the small early scales launch-bound.
+        # (dynamic=True would DISABLE cudagraphs, which is why the earlier attempt was a no-op.)
         for b in model.unregistered_blocks:
-            b.forward = torch.compile(b.forward, dynamic=True)
-        print("[compile] block.forward torch.compile(dynamic=True) — first run pays compile cost")
+            b.forward = torch.compile(b.forward, mode="reduce-overhead")
+        print("[compile] block.forward torch.compile(mode=reduce-overhead, cudagraphs) — first run pays compile cost")
 
     scale_schedule = dynamic_resolution_h_w[args.h_div_w_template][args.pn]["scales"]
     scale_schedule = [(1, h, w) for (_, h, w) in scale_schedule]
