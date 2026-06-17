@@ -41,11 +41,42 @@ quality not yet validated on the 5-prompt eval. **Key implication:** batch-1 INT
 (11.8 GB) < 14.5 GB → should let the **T4** fit T5-resident + CUDA-graphs (which OOM in fp16)
 → the path to port the A100 −67% latency win down to the T4 (not yet retested).
 
+### Throughput history (A100, all runs)
+Throughput is measured **eager** (the static-batch path; CUDA graphs and batching are not
+yet combined in the code). Re-confirmed run-to-run: peak-mem figures are byte-stable.
+| date | KV | b1 img/s | b2 img/s | b4 img/s | b1 peak | b2 peak | b4 peak | ceiling |
+|---|---|---|---|---|---|---|---|---|
+| early | fp16 | 0.53 | **0.68** | OOM | 16.9 GB | 25.9 GB | — | b2 |
+| early | INT8 | 0.48 | 0.62 | **0.71** | 11.8 GB | 15.6 GB | 23.3 GB | b4 |
+| 2026-06-17 | fp16 | 0.53 | **0.68** | OOM | 16.9 GB | 25.9 GB | — | b2 |
+| 2026-06-17 | INT8 | 0.48 | 0.62 | (run cut at b2) | 11.8 GB | 15.6 GB | — | ≥b2 |
+
+**The serving-throughput punchline:** eager batching is *worse* than graphed single-stream,
+because the model is **launch-bound on the small scales** (batching doesn't remove launches,
+graphs do). Best **sustained img/s per A100 today = graphed single-stream = 1 / 1.288 s =
+`0.776 img/s`.** Eager batch-2 (0.68) and INT8 batch-4 (0.71) both come in *under* it.
+→ The biggest open serving win is **graphs + batching combined** (untested): a graphed batch-4
+should roughly double per-GPU img/s and ~halve the fleet below.
+
+### Serving capacity — how many A100s for a target QPS
+At the measured best **0.776 img/s/A100** (graphed single-stream, bf16, 1024px, cfg=4),
+`N = ceil(target_QPS / 0.776)`:
+| target | 1 QPS | 2 QPS | 5 QPS | 10 QPS | 25 QPS | 50 QPS | 100 QPS |
+|---|---|---|---|---|---|---|---|
+| **#A100 (today)** | 2 | 3 | 7 | 13 | 33 | 65 | 129 |
+| **#A100 (if graphs+batch4 lands, ~1.5 img/s)** | 1 | 2 | 4 | 7 | 17 | 34 | 67 |
+
+Caveats: SPOT availability, T5 kept *resident* (offload would tax each request ~1.9 s),
+and no request-batching server yet (numbers are per-GPU single-stream). A real serving stack
+(continuous batching + graphs) is the path to the right-hand column.
+
 ---
 
 ## Techniques that do NOT work (null results — don't retry)
 | Technique | Result | Why |
 |---|---|---|
+| **INT8 GEMM / W8A8** (`--int8_gemm`, torchao) | **A100 1.90 → 6.70 s (3.5× SLOWER)** | per-op dynamic quant/dequant overhead dwarfs the matmul; A100 bf16 tensor cores already saturate these small GEMMs (and CFG only doubles bs). Incompatible with CUDA graphs too. Lossy *and* slower → dead. |
+| **VAE decode channels-last** (`--vae_channels_last`, NHWC) | **A100 1.288 → 1.352 s (+64 ms)** | the `contiguous(channels_last)` layout copy + cudnn picking a non-faster conv algo at this size costs more than any NHWC conv gain. Lossless but slower. |
 | mem-efficient SDPA backend (`--attn_backend mem_efficient`) | no change | already the default (no FA2 on Turing; A100 SDPA picks FA2 itself) |
 | `torch.compile(dynamic=True)` | no change | dynamic disables cudagraphs; graph breaks on varlen cross-attn |
 | `torch.compile(reduce-overhead)` auto-cudagraphs | **RuntimeError** | residual-stream output aliasing across blocks + cross-attn graph breaks |

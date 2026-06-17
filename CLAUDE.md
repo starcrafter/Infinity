@@ -22,7 +22,9 @@ decoding etc. don't apply — VAR already emits a whole scale in parallel).
 
 **T4 (fp16):** baseline 13.6 s. Lossless levers ≈ 0 (SDPA already optimal, compile no-op, T5-resident & CUDA-graphs OOM at 16 GB). The path to porting the A100 wins to T4 is **INT8 KV** (halves the persistent cache → should fit T5-resident + graphs; not yet retested).
 
-**What does NOT work (don't retry):** mem-efficient SDPA backend (already default), `torch.compile(dynamic)` (no-op), `torch.compile(reduce-overhead)` auto-cudagraphs (residual/KV aliasing + cross-attn graph breaks), no-CFG (`--cfg 1`, lossy, ~−31% T4 but risky).
+**What does NOT work (don't retry):** **INT8 GEMM / W8A8** (`--int8_gemm`, torchao) — **3.5× slower** on A100 (per-op quant overhead > matmul; bf16 tensor cores already saturate the small GEMMs); **VAE channels-last** (`--vae_channels_last`) — +64 ms (layout-copy cost > NHWC conv gain); mem-efficient SDPA backend (already default), `torch.compile(dynamic)` (no-op), `torch.compile(reduce-overhead)` auto-cudagraphs (residual/KV aliasing + cross-attn graph breaks), no-CFG (`--cfg 1`, lossy, ~−31% T4 but risky).
+
+**Serving capacity:** best sustained = **graphed single-stream 0.776 img/s/A100** (eager batching is *worse* — launch-bound). `N_A100 = ceil(QPS / 0.776)`: 1 QPS→2, 10 QPS→13, 100 QPS→129. Biggest open win = **graphs + batching combined** (untested, ~halves the fleet).
 
 ## `codesign/` toolkit
 - **`t4_compat.py`** — SDPA `flash_attn` stub (the repo `import flash_attn`s unconditionally; FA2 doesn't build on Turing and has no torch-2.9/py3.10/cu12.9 prebuilt wheel). Provides a varlen cross-attn fallback that's **CUDA-graph-safe** (query offsets from shapes, key offsets cached by id — no `.item()` sync). Call `t4_compat.install()` BEFORE importing `infinity.models.*`. Unit-tested on CPU (`python t4_compat.py`).
