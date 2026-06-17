@@ -216,41 +216,31 @@ def main():
         model.vae_channels_last = True
         print("[vae_channels_last] VAE decode in NHWC (channels_last)")
 
+    if getattr(args, "int8_gemm", 0) or getattr(args, "fp8_gemm", 0):
+        import torch.nn as _nn
+        from torchao.quantization import quantize_
+        # mat_qkv (self-attn) & mat_kv (cross-attn) call raw F.linear(weight=..., bias=cat(...))
+        # with a KEYWORD weight + concatenated bias -> torchao's Float8/Int8 __torch_function__
+        # dispatch indexes args[1] positionally and raises IndexError. Skip them; the big GEMMs
+        # (MLP fc1/fc2, proj, mat_q) use standard nn.Linear.forward and quantize fine.
+        _SKIP = ("mat_qkv", "mat_kv")
+        def _qfilter(m, fqn):
+            return isinstance(m, _nn.Linear) and fqn.split(".")[-1] not in _SKIP
+
     if getattr(args, "int8_gemm", 0):
-        # W8A8 dynamic-activation int8 weight quant on the transformer's Linear layers.
-        # Lossy -> validate on the 5-prompt eval before trusting. Incompatible with
-        # CUDA graphs (subclass tensors + dynamic quant), so run it standalone.
-        try:
-            from torchao.quantization import quantize_
-            try:  # torchao >=0.10 config API
-                from torchao.quantization import Int8DynamicActivationInt8WeightConfig as _W8A8
-                quantize_(model, _W8A8())
-            except ImportError:  # older function API
-                from torchao.quantization import int8_dynamic_activation_int8_weight as _W8A8
-                quantize_(model, _W8A8())
-            print("[int8_gemm] torchao W8A8 applied to transformer Linear layers")
-        except Exception as e:
-            print(f"[int8_gemm] FAILED ({type(e).__name__}: {e}); run `pip install torchao`")
-            raise
+        # W8A8 dynamic int8 — A100 was 3.5x slower (no native int8 + heavy quant). Lossy.
+        from torchao.quantization import Int8DynamicActivationInt8WeightConfig as _W8A8
+        quantize_(model, _W8A8(), filter_fn=_qfilter)
+        print("[int8_gemm] torchao W8A8 applied (MLP/proj/mat_q; mat_qkv/mat_kv skipped)")
 
     if getattr(args, "fp8_gemm", 0):
-        # FP8 (e4m3) dynamic-activation FP8-weight quant — Hopper-native tensor cores.
-        # Unlike A100 int8 (3.5x slower: no native int8 path + heavy quant), H100 has
-        # hardware FP8 GEMM and cheaper quant. Rowwise granularity for quality. Lossy.
+        # FP8 (e4m3) dynamic — Hopper-native tensor cores + cheap quant. Lossy.
         if cc[0] < 9:
-            print(f"[fp8_gemm] WARNING: sm_{cc[0]}{cc[1]} has no native FP8 tensor cores (need sm_90 H100) — expect a regression")
-        try:
-            from torchao.quantization import quantize_, Float8DynamicActivationFloat8WeightConfig
-            try:
-                from torchao.quantization import PerRow
-                quantize_(model, Float8DynamicActivationFloat8WeightConfig(granularity=PerRow()))
-                print("[fp8_gemm] torchao FP8 e4m3 rowwise applied to transformer Linear layers")
-            except Exception:
-                quantize_(model, Float8DynamicActivationFloat8WeightConfig())
-                print("[fp8_gemm] torchao FP8 e4m3 (per-tensor) applied to transformer Linear layers")
-        except Exception as e:
-            print(f"[fp8_gemm] FAILED ({type(e).__name__}: {e}); needs torchao + H100")
-            raise
+            print(f"[fp8_gemm] WARNING: sm_{cc[0]}{cc[1]} has no native FP8 (need sm_90) — expect a regression")
+        from torchao.quantization import Float8DynamicActivationFloat8WeightConfig as _FP8
+        from torchao.quantization.granularity import PerRow
+        quantize_(model, _FP8(granularity=PerRow()), filter_fn=_qfilter)
+        print("[fp8_gemm] torchao FP8 e4m3 rowwise applied (MLP/proj/mat_q; mat_qkv/mat_kv skipped)")
 
     scale_schedule = dynamic_resolution_h_w[args.h_div_w_template][args.pn]["scales"]
     scale_schedule = [(1, h, w) for (_, h, w) in scale_schedule]

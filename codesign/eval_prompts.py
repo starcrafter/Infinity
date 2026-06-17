@@ -63,18 +63,19 @@ def main():
     model = load_transformer(vae, args)
 
     if getattr(args, "fp8_gemm", 0) or getattr(args, "int8_gemm", 0):
+        import torch.nn as _nn
         from torchao.quantization import quantize_
+        _SKIP = ("mat_qkv", "mat_kv")  # raw F.linear(weight=...) breaks torchao dispatch
+        def _qfilter(m, fqn):
+            return isinstance(m, _nn.Linear) and fqn.split(".")[-1] not in _SKIP
         if args.fp8_gemm:
             from torchao.quantization import Float8DynamicActivationFloat8WeightConfig as _C
-            try:
-                from torchao.quantization import PerRow
-                quantize_(model, _C(granularity=PerRow()))
-            except Exception:
-                quantize_(model, _C())
+            from torchao.quantization.granularity import PerRow
+            quantize_(model, _C(granularity=PerRow()), filter_fn=_qfilter)
             print("[fp8_gemm] applied (quality eval)")
         else:
             from torchao.quantization import Int8DynamicActivationInt8WeightConfig as _C
-            quantize_(model, _C()); print("[int8_gemm] applied (quality eval)")
+            quantize_(model, _C(), filter_fn=_qfilter); print("[int8_gemm] applied (quality eval)")
 
     ss = dynamic_resolution_h_w[args.h_div_w_template][args.pn]["scales"]
     ss = [(1, h, w) for (_, h, w) in ss]
