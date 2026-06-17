@@ -47,6 +47,7 @@ def main():
     add_common_arguments(p)
     p.add_argument("--out_dir", default="eval_out")
     p.add_argument("--tag", default="baseline", help="label prefix for output files")
+    p.add_argument("--cuda_graph", type=int, default=0, choices=[0,1])
     args = p.parse_args()
     args.cfg = list(map(float, str(args.cfg).split(",")))
     args.cfg = args.cfg[0] if len(args.cfg) == 1 else args.cfg
@@ -61,12 +62,22 @@ def main():
     ss = dynamic_resolution_h_w[args.h_div_w_template][args.pn]["scales"]
     ss = [(1, h, w) for (_, h, w) in ss]
 
+    use_graph = getattr(args, "cuda_graph", 0)
+    if use_graph:
+        model.use_cuda_graph = True
+        print("[cuda_graph] per-prompt reset; warmup->capture->replay, saving the replayed image")
+
     os.makedirs(args.out_dir, exist_ok=True)
     print(f"\n==== eval set ({args.tag}), {len(PROMPTS)} prompts, pn={args.pn} ====")
     for name, prompt, seed in PROMPTS:
         args.seed = seed
+        if use_graph:
+            # capture caches per fixed prompt -> reset, then run warmup(alloc)->capture->replay
+            model.reset_cuda_graph()
+            for _ in range(2):  # gen0 eager-alloc, gen1 capture
+                generate(model, vae, text_tokenizer, text_encoder, prompt, ss, args, CudaTimer(), amp)
         t = CudaTimer()
-        img, _ = generate(model, vae, text_tokenizer, text_encoder, prompt, ss, args, t, amp)
+        img, _ = generate(model, vae, text_tokenizer, text_encoder, prompt, ss, args, t, amp)  # replay (or eager)
         ms = sum(m for _, m in t.report())
         fn = os.path.join(args.out_dir, f"{args.tag}_{name}.jpg")
         cv2.imwrite(fn, img.cpu().numpy())

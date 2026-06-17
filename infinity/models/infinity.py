@@ -483,6 +483,18 @@ class Infinity(nn.Module):
         g.replay()
         return static_out
 
+    def reset_cuda_graph(self):
+        """Drop captured graphs + cached cond/ca_kv + KV buffers so the next prompt
+        captures fresh. Needed when switching prompts (capture caches per fixed prompt)."""
+        self._cg = {}
+        self._gen_idx = 0
+        self._cg_cond_BD = self._cg_cond_gss = self._cg_cakv = None
+        for b in self.unregistered_blocks:
+            attn = b.sa if isinstance(b, CrossAttnBlock) else b.attn
+            attn.cached_k = None; attn.cached_v = None; attn.kv_len = 0
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     @torch.no_grad()
     def autoregressive_infer_cfg(
         self,
